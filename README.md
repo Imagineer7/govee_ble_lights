@@ -91,3 +91,22 @@ We aim to continuously improve this integration by:
 ## License
 
 This project is under the MIT License. For full license details, please refer to the [LICENSE file](https://github.com/Beshelmek/govee_ble_lights/blob/main/LICENSE) in this repository.
+
+## Segment control (fork additions)
+
+For segmented BLE models (`SEGMENTED_MODELS` in `const.py`, including H617F/H617C), each strip gets:
+
+- **15 segment lights** (`light.<device>_segment_1` … `_15`) with color and brightness, usable in scenes and automations.
+- **A preset selector** (`select.<device>_preset`).
+- **Actions** under `govee_ble_lights.*`: `set_segment_color`, `set_segments`, `apply_preset`, `save_preset`, `delete_preset`. Target the main strip light by `entity_id`.
+- **A dashboard card**, loaded automatically:
+
+```yaml
+type: custom:govee-segment-card
+entity: light.govee_light_2
+name: Bedroom strip   # optional
+```
+
+![Govee segment control card example](assets/Govee_Light_Segment_Control_Ex.png)
+
+Presets are stored in `.storage/govee_ble_lights.presets` and shared by all strips.
