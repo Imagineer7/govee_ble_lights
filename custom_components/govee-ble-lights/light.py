@@ -1,53 +1,43 @@
 from __future__ import annotations
 
 import array
+import asyncio
+import base64
+import json
 import logging
 import re
-
+from datetime import timedelta
 from enum import IntEnum
-import bleak_retry_connector
+from pathlib import Path
 
+import bleak_retry_connector
 from bleak import BleakClient
 from homeassistant.components import bluetooth
 from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATTR_EFFECT, ColorMode, LightEntity,
                                             LightEntityFeature, ATTR_COLOR_TEMP_KELVIN)
-
-from homeassistant.core import HomeAssistant, ServiceCall
-import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_ON, STATE_OFF
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.storage import Store
 import homeassistant.util.color as color_util
 
-from .const import DOMAIN
-from pathlib import Path
-import json
-from .govee_utils import prepareMultiplePacketsData
-import base64
 from . import Hub
-from datetime import timedelta
+from .const import (DOMAIN, SEGMENTED_MODELS, DATA_BLE_LIGHTS, DATA_PRESET_SELECTS, DATA_PRESETS,
+                    segment_count_for, build_device_info)
+from .govee_utils import prepareMultiplePacketsData
+from .presets import resample
 
 SCAN_INTERVAL = timedelta(seconds=30)
-
 
 _LOGGER = logging.getLogger(__name__)
 
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
-EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
-SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H617F', 'H617C']
-MAX_SEGMENTS = 15  # bitmask is 2 bytes; 15 segments = 0xFF 0x7F
+EFFECT_PARSE = re.compile(r"\[(\d+)/(\d+)/(\d+)/(\d+)]")
 
-SERVICE_DOMAIN = "govee_ble_lights"
-SERVICE_SET_SEGMENT_COLOR = "set_segment_color"
-_BLE_LIGHTS: list = []
-SET_SEGMENT_COLOR_SCHEMA = {
-    vol.Required("segments"): vol.All(
-        cv.ensure_list, [vol.All(vol.Coerce(int), vol.Range(min=1, max=MAX_SEGMENTS))]
-    ),
-    vol.Required("rgb_color"): vol.All(
-        vol.Coerce(tuple), vol.ExactSequence((cv.byte, cv.byte, cv.byte))
-    ),
-}
+RGBTuple = tuple[int, int, int]
+
 
 class LedCommand(IntEnum):
     """ A control command packet's type. """
@@ -59,7 +49,7 @@ class LedCommand(IntEnum):
 class LedMode(IntEnum):
     """
     The mode in which a color change happens in.
-    
+
     Currently only manual is supported.
     """
     MANUAL = 0x02
@@ -82,28 +72,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 async_add_entities([GoveeAPILight(hub, device)])
     elif hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
-        entity = GoveeBluetoothLight(hub, ble_device, config_entry)
-        async_add_entities([entity])
-        _BLE_LIGHTS.append(entity)
-
-        # Per-segment color control (BLE segmented models only).
-        # Registered under an underscore domain because HA rejects action
-        # names containing '-' (the integration domain is govee-ble-lights).
-        if not hass.services.has_service(SERVICE_DOMAIN, SERVICE_SET_SEGMENT_COLOR):
-            async def _handle_set_segment_color(call: ServiceCall) -> None:
-                targets = call.data.get("entity_id", [])
-                for ent in list(_BLE_LIGHTS):
-                    if ent.hass is None or ent.entity_id is None:
-                        continue
-                    if targets == "all" or ent.entity_id in targets:
-                        await ent.async_set_segment_color(call.data["segments"], call.data["rgb_color"])
-
-            hass.services.async_register(
-                SERVICE_DOMAIN,
-                SERVICE_SET_SEGMENT_COLOR,
-                _handle_set_segment_color,
-                schema=cv.make_entity_service_schema(SET_SEGMENT_COLOR_SCHEMA),
-            )
+        light = GoveeBluetoothLight(hub, ble_device, config_entry)
+        entities: list[LightEntity] = [light]
+        if light.segment_count:
+            light.segment_entities = [GoveeSegmentLight(light, i) for i in range(light.segment_count)]
+            entities.extend(light.segment_entities)
+        async_add_entities(entities)
 
 
 class GoveeAPILight(LightEntity, dict):
@@ -238,11 +212,13 @@ class GoveeAPILight(LightEntity, dict):
         self._state = False
 
 
-class GoveeBluetoothLight(LightEntity):
+class GoveeBluetoothLight(RestoreEntity, LightEntity):
     _attr_color_mode = ColorMode.RGB
     _attr_supported_color_modes = {ColorMode.RGB}
     _attr_supported_features = LightEntityFeature(
         LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
+    # Card/automation helpers; no need to fill the recorder database with them.
+    _unrecorded_attributes = frozenset({"segment_count", "segment_colors", "segment_entities", "preset_entity"})
 
     def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
         """Initialize an bluetooth light."""
@@ -252,6 +228,16 @@ class GoveeBluetoothLight(LightEntity):
         self._ble_device = ble_device
         self._state = None
         self._brightness = None
+        self._entry_id = config_entry.entry_id
+        self._device_name = config_entry.title or f"Govee {self._model}"
+
+        self.segment_count = segment_count_for(self._model)
+        # Last color sent to each segment (None = unknown, e.g. after a scene)
+        self.segment_colors: list[RGBTuple | None] = [None] * self.segment_count
+        self.segment_entities: list[GoveeSegmentLight] = []
+
+        self._client: BleakClient | None = None
+        self._lock = asyncio.Lock()
 
     @property
     def effect_list(self) -> list[str] | None:
@@ -282,6 +268,10 @@ class GoveeBluetoothLight(LightEntity):
         return self._mac.replace(":", "")
 
     @property
+    def device_info(self):
+        return build_device_info(self.unique_id, self._device_name, self._model)
+
+    @property
     def brightness(self):
         return self._brightness
 
@@ -290,15 +280,52 @@ class GoveeBluetoothLight(LightEntity):
         """Return true if light is on."""
         return self._state
 
+    @property
+    def extra_state_attributes(self):
+        if not self.segment_count:
+            return None
+        preset_select = self.hass.data.get(DATA_PRESET_SELECTS, {}).get(self._entry_id) if self.hass else None
+        return {
+            "segment_count": self.segment_count,
+            "segment_colors": [list(c) if c is not None else None for c in self.segment_colors],
+            "segment_entities": [e.entity_id for e in self.segment_entities if e.entity_id],
+            "preset_entity": preset_select.entity_id if preset_select else None,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.hass.data.setdefault(DATA_BLE_LIGHTS, {})[self._entry_id] = self
+
+        # BLE strips can't report their state, so restore what we last sent.
+        last = await self.async_get_last_state()
+        if last is not None:
+            if last.state in (STATE_ON, STATE_OFF):
+                self._state = last.state == STATE_ON
+            if isinstance(last.attributes.get(ATTR_BRIGHTNESS), int):
+                self._brightness = last.attributes[ATTR_BRIGHTNESS]
+            saved = last.attributes.get("segment_colors")
+            if isinstance(saved, list) and len(saved) == self.segment_count:
+                self.segment_colors = [tuple(c) if isinstance(c, list) and len(c) == 3 else None for c in saved]
+
+    async def async_will_remove_from_hass(self) -> None:
+        lights = self.hass.data.get(DATA_BLE_LIGHTS, {})
+        if lights.get(self._entry_id) is self:
+            lights.pop(self._entry_id)
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
+
     async def async_turn_on(self, **kwargs) -> None:
         commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
-
-        self._state = True
+        new_segment_colors = None
+        clear_preset = False
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
             commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
-            self._brightness = brightness
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
@@ -307,8 +334,10 @@ class GoveeBluetoothLight(LightEntity):
                 commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
                                                               [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
                                                                0x00, 0x00, 0xFF, 0x7F]))
+                new_segment_colors = [(red, green, blue)] * self.segment_count
             else:
                 commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
+            clear_preset = True
         if ATTR_EFFECT in kwargs:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
@@ -333,50 +362,125 @@ class GoveeBluetoothLight(LightEntity):
                                                                       base64.b64decode(specialEffect['scenceParam'])
                                                                       )):
                     commands.append(command)
+                # Scene colors aren't known to us
+                new_segment_colors = [None] * self.segment_count
+                clear_preset = True
 
-        for command in commands:
-            client = await self._connectBluetooth()
-            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
-
-    async def async_set_segment_color(self, segments, rgb_color) -> None:
-        """Set one color on a subset of segments (1-based segment numbers)."""
-        if not self._is_segmented:
-            _LOGGER.warning("%s (%s) is not in SEGMENTED_MODELS; ignoring set_segment_color",
-                            self._mac, self._model)
-            return
-
-        mask = 0
-        for seg in segments:
-            mask |= 1 << (seg - 1)
-
-        red, green, blue = rgb_color
-        commands = [
-            self._prepareSinglePacketData(LedCommand.POWER, [0x1]),
-            self._prepareSinglePacketData(LedCommand.COLOR,
-                                          [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
-                                           0x00, 0x00, mask & 0xFF, (mask >> 8) & 0xFF]),
-        ]
-
-        client = await self._connectBluetooth()
-        for command in commands:
-            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+        await self._async_send(commands)
 
         self._state = True
-        self.async_write_ha_state()
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness = kwargs[ATTR_BRIGHTNESS]
+        if new_segment_colors is not None and self.segment_count:
+            self.segment_colors = new_segment_colors
+        if clear_preset:
+            self._set_current_preset(None)
+        self._async_segments_changed()
 
     async def async_turn_off(self, **kwargs) -> None:
-        client = await self._connectBluetooth()
-        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                     self._prepareSinglePacketData(LedCommand.POWER, [0x0]), False)
+        await self._async_send([self._prepareSinglePacketData(LedCommand.POWER, [0x0])])
         self._state = False
+        self._async_segments_changed()
 
-    async def _connectBluetooth(self) -> BleakClient:
+    # ---- Segment control -------------------------------------------------
+
+    async def async_apply_segment_colors(self, updates: dict[int, RGBTuple], preset: str | None = None) -> None:
+        """Send colors for some segments. Keys are 0-based segment indexes."""
+        if not self.segment_count:
+            raise HomeAssistantError(f"{self._model} is not a segmented model (add it to SEGMENTED_MODELS)")
+
+        clean: dict[int, RGBTuple] = {}
+        for idx, rgb in updates.items():
+            if 0 <= idx < self.segment_count and rgb is not None:
+                clean[idx] = tuple(max(0, min(255, int(c))) for c in rgb)  # type: ignore[assignment]
+        if not clean:
+            return
+
+        # One packet per distinct color, with a bitmask of the segments using it
+        groups: dict[RGBTuple, int] = {}
+        for idx, rgb in clean.items():
+            groups[rgb] = groups.get(rgb, 0) | (1 << idx)
+
+        commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
+        for (red, green, blue), mask in groups.items():
+            commands.append(self._prepareSinglePacketData(
+                LedCommand.COLOR,
+                [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00, 0x00, 0x00,
+                 mask & 0xFF, (mask >> 8) & 0xFF]))
+
+        await self._async_send(commands)
+
+        for idx, rgb in clean.items():
+            self.segment_colors[idx] = rgb
+        self._state = True
+        self._set_current_preset(preset)
+        self._async_segments_changed()
+
+    async def async_set_segment_color(self, segments: list[int], rgb_color) -> None:
+        """Set one color on a list of 1-based segment numbers."""
+        await self.async_apply_segment_colors({s - 1: tuple(rgb_color) for s in segments})
+
+    async def async_set_segments(self, colors: list) -> None:
+        """Set colors for segments 1..N in order. None entries are left as-is."""
+        await self.async_apply_segment_colors(
+            {i: tuple(c) for i, c in enumerate(colors[:self.segment_count]) if c is not None})
+
+    async def async_apply_preset(self, name: str) -> None:
+        presets = self.hass.data[DATA_PRESETS].presets
+        if name not in presets:
+            raise HomeAssistantError(f"No preset named '{name}'")
+        colors = resample(presets[name], self.segment_count)
+        await self.async_apply_segment_colors({i: tuple(c) for i, c in enumerate(colors)}, preset=name)
+
+    def _set_current_preset(self, name: str | None) -> None:
+        preset_select = self.hass.data.get(DATA_PRESET_SELECTS, {}).get(self._entry_id) if self.hass else None
+        if preset_select is not None:
+            preset_select.set_current(name)
+
+    def _async_segments_changed(self) -> None:
+        self.async_write_ha_state()
+        for segment in self.segment_entities:
+            if segment.hass is not None:
+                segment.async_write_ha_state()
+
+    # ---- Bluetooth -------------------------------------------------------
+
+    async def _async_send(self, commands: list[bytes]) -> None:
+        """Send packets over one (reused) connection, serialized per strip."""
+        async with self._lock:
+            for attempt in range(2):
+                try:
+                    client = await self._async_get_client()
+                    for i, command in enumerate(commands):
+                        if i:
+                            await asyncio.sleep(0.02)
+                        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+                    return
+                except Exception as err:  # noqa: BLE001
+                    self._client = None
+                    if attempt:
+                        raise HomeAssistantError(f"Failed to send to Govee light {self._mac}: {err}") from err
+                    _LOGGER.debug("Send to %s failed (%s), reconnecting", self._mac, err)
+
+    async def _async_get_client(self) -> BleakClient:
+        if self._client is not None and self._client.is_connected:
+            return self._client
+        client = await self._connectBluetooth()
+        if client is None:
+            raise HomeAssistantError(f"Could not connect to Govee light {self._mac}")
+        self._client = client
+        return client
+
+    async def _connectBluetooth(self) -> BleakClient | None:
+        device = bluetooth.async_ble_device_from_address(self.hass, self._mac.upper(), True) or self._ble_device
         for i in range(3):
             try:
-                client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.unique_id)
+                client = await bleak_retry_connector.establish_connection(BleakClient, device, self.unique_id)
                 return client
-            except:
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Connect attempt %s to %s failed: %s", i + 1, self._mac, err)
                 continue
+        return None
 
     def _prepareSinglePacketData(self, cmd, payload):
         if not isinstance(cmd, int):
@@ -401,3 +505,82 @@ class GoveeBluetoothLight(LightEntity):
 
         frame += bytes([checksum & 0xFF])
         return frame
+
+
+class GoveeSegmentLight(LightEntity):
+    """One segment of a segmented Govee BLE strip, as its own light."""
+
+    _attr_has_entity_name = True
+    _attr_color_mode = ColorMode.RGB
+    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_should_poll = False
+
+    def __init__(self, parent: GoveeBluetoothLight, index: int) -> None:
+        self._parent = parent
+        self._index = index
+        self._attr_name = f"Segment {index + 1}"
+        self._attr_unique_id = f"{parent.unique_id}_segment_{index + 1}"
+        self._attr_icon = "mdi:led-strip-variant"
+        self._last_on_color: RGBTuple = (255, 255, 255)
+        self._last_on_level = 255
+
+    @property
+    def device_info(self):
+        return self._parent.device_info
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Refresh the strip's segment_entities attribute now that we have an entity_id
+        if self._parent.hass is not None and self._parent.entity_id:
+            self._parent.async_write_ha_state()
+
+    def _raw(self) -> RGBTuple | None:
+        return self._parent.segment_colors[self._index]
+
+    @staticmethod
+    def _normalize(rgb: RGBTuple) -> RGBTuple:
+        peak = max(rgb)
+        return tuple(round(c * 255 / peak) for c in rgb)  # type: ignore[return-value]
+
+    @property
+    def is_on(self) -> bool | None:
+        if self._parent.is_on is False:
+            return False
+        raw = self._raw()
+        if raw is None:
+            return None
+        return any(raw)
+
+    @property
+    def brightness(self) -> int | None:
+        raw = self._raw()
+        return max(raw) if raw and any(raw) else None
+
+    @property
+    def rgb_color(self):
+        raw = self._raw()
+        return self._normalize(raw) if raw and any(raw) else None
+
+    async def async_turn_on(self, **kwargs) -> None:
+        raw = self._raw()
+        lit = raw is not None and any(raw)
+        if ATTR_RGB_COLOR in kwargs:
+            base = tuple(kwargs[ATTR_RGB_COLOR])
+        elif lit:
+            base = self._normalize(raw)
+        else:
+            base = self._last_on_color
+        if not any(base):
+            base = self._last_on_color
+        level = kwargs.get(ATTR_BRIGHTNESS, max(raw) if lit else self._last_on_level)
+        color = tuple(round(c * level / 255) for c in base)
+        self._last_on_color = base  # type: ignore[assignment]
+        self._last_on_level = level
+        await self._parent.async_apply_segment_colors({self._index: color})
+
+    async def async_turn_off(self, **kwargs) -> None:
+        raw = self._raw()
+        if raw is not None and any(raw):
+            self._last_on_color = self._normalize(raw)
+            self._last_on_level = max(raw)
+        await self._parent.async_apply_segment_colors({self._index: (0, 0, 0)})

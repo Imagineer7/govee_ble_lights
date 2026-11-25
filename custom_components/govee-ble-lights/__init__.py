@@ -11,12 +11,15 @@ from homeassistant.helpers.storage import Store
 
 from .govee_api import GoveeAPI
 
-from .const import DOMAIN
+from .const import DOMAIN, DATA_PRESETS, CARD_URL, CARD_VERSION
+from .presets import PresetStore
+from .services import async_register_services
+from pathlib import Path
 import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[str] = ["light"]
+PLATFORMS: list[str] = ["light", "select"]
 
 
 class Hub:
@@ -114,4 +117,22 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # init storage for registries
     hass.data[DOMAIN] = {}
+
+    # Segment presets + govee_ble_lights.* actions
+    presets = PresetStore(hass)
+    await presets.async_load()
+    hass.data[DATA_PRESETS] = presets
+    async_register_services(hass)
+
+    # Serve and auto-load the segment dashboard card
+    try:
+        from homeassistant.components.frontend import add_extra_js_url
+        from homeassistant.components.http import StaticPathConfig
+
+        card_path = Path(__file__).parent / "frontend" / "govee-segment-card.js"
+        await hass.http.async_register_static_paths([StaticPathConfig(CARD_URL, str(card_path), False)])
+        add_extra_js_url(hass, f"{CARD_URL}?v={CARD_VERSION}")
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("Could not register the Govee segment card: %s", err)
+
     return True
