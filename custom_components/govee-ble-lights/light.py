@@ -12,7 +12,9 @@ from homeassistant.components import bluetooth
 from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATTR_EFFECT, ColorMode, LightEntity,
                                             LightEntityFeature, ATTR_COLOR_TEMP_KELVIN)
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.storage import Store
 import homeassistant.util.color as color_util
@@ -32,7 +34,20 @@ _LOGGER = logging.getLogger(__name__)
 
 UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
 EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
-SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199']
+SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199', 'H617F', 'H617C']
+MAX_SEGMENTS = 15  # bitmask is 2 bytes; 15 segments = 0xFF 0x7F
+
+SERVICE_DOMAIN = "govee_ble_lights"
+SERVICE_SET_SEGMENT_COLOR = "set_segment_color"
+_BLE_LIGHTS: list = []
+SET_SEGMENT_COLOR_SCHEMA = {
+    vol.Required("segments"): vol.All(
+        cv.ensure_list, [vol.All(vol.Coerce(int), vol.Range(min=1, max=MAX_SEGMENTS))]
+    ),
+    vol.Required("rgb_color"): vol.All(
+        vol.Coerce(tuple), vol.ExactSequence((cv.byte, cv.byte, cv.byte))
+    ),
+}
 
 class LedCommand(IntEnum):
     """ A control command packet's type. """
@@ -67,7 +82,28 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 async_add_entities([GoveeAPILight(hub, device)])
     elif hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
-        async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
+        entity = GoveeBluetoothLight(hub, ble_device, config_entry)
+        async_add_entities([entity])
+        _BLE_LIGHTS.append(entity)
+
+        # Per-segment color control (BLE segmented models only).
+        # Registered under an underscore domain because HA rejects action
+        # names containing '-' (the integration domain is govee-ble-lights).
+        if not hass.services.has_service(SERVICE_DOMAIN, SERVICE_SET_SEGMENT_COLOR):
+            async def _handle_set_segment_color(call: ServiceCall) -> None:
+                targets = call.data.get("entity_id", [])
+                for ent in list(_BLE_LIGHTS):
+                    if ent.hass is None or ent.entity_id is None:
+                        continue
+                    if targets == "all" or ent.entity_id in targets:
+                        await ent.async_set_segment_color(call.data["segments"], call.data["rgb_color"])
+
+            hass.services.async_register(
+                SERVICE_DOMAIN,
+                SERVICE_SET_SEGMENT_COLOR,
+                _handle_set_segment_color,
+                schema=cv.make_entity_service_schema(SET_SEGMENT_COLOR_SCHEMA),
+            )
 
 
 class GoveeAPILight(LightEntity, dict):
@@ -301,6 +337,32 @@ class GoveeBluetoothLight(LightEntity):
         for command in commands:
             client = await self._connectBluetooth()
             await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+
+    async def async_set_segment_color(self, segments, rgb_color) -> None:
+        """Set one color on a subset of segments (1-based segment numbers)."""
+        if not self._is_segmented:
+            _LOGGER.warning("%s (%s) is not in SEGMENTED_MODELS; ignoring set_segment_color",
+                            self._mac, self._model)
+            return
+
+        mask = 0
+        for seg in segments:
+            mask |= 1 << (seg - 1)
+
+        red, green, blue = rgb_color
+        commands = [
+            self._prepareSinglePacketData(LedCommand.POWER, [0x1]),
+            self._prepareSinglePacketData(LedCommand.COLOR,
+                                          [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
+                                           0x00, 0x00, mask & 0xFF, (mask >> 8) & 0xFF]),
+        ]
+
+        client = await self._connectBluetooth()
+        for command in commands:
+            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+
+        self._state = True
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         client = await self._connectBluetooth()
